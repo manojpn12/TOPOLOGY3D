@@ -11,7 +11,7 @@ class JAXSolver:
         self.mesh = mesh
         self.material = material
         self.Ktemplates = getKMatrixGridMeshTemplates(mesh.elemSize, 'structural')
-        self.objectiveHandle = jit(self.objective)
+        self.objectiveHandle = self.objective
         self.D0 = self.material.getD0elemMatrix(self.mesh)
 
     def objective(self, C):
@@ -23,7 +23,8 @@ class JAXSolver:
                 sK += jnp.einsum('e,jk->ejk', C[k], self.Ktemplates[k])
             K = jnp.zeros((self.mesh.ndof, self.mesh.ndof))
             K = K.at[self.mesh.nodeIdx].add(sK.flatten())
-            K+= 1e-6 *jnp.eye(self.mesh.ndof)  # Add small value to diagonal for numerical stability
+            K+= 5e-3 *jnp.eye(self.mesh.ndof)  # Add small value to diagonal for numerical stability
+
             return K
 
         @jit
@@ -44,11 +45,20 @@ class JAXSolver:
         # Add timing for K assembly
         start_assembly = time.perf_counter()
         K = assembleK(C)
+        jax.debug.print("🔎 NaN check: Any NaN in global K matrix? {}", jnp.any(jnp.isnan(K)))
+        jax.debug.print("🔎 NaN check: Any Inf in global K matrix? {}", jnp.any(jnp.isinf(K)))
+        min_val = jnp.min(jnp.abs(K))
+        jax.debug.print("🔎 Minimum absolute value in K: {}", min_val)
         end_assembly = time.perf_counter()
         
         # Add timing for solving system
         start_solve = time.perf_counter()
+        K_free = K[self.mesh.bc['free'], :][:, self.mesh.bc['free']]
+        jax.debug.print("🔎 Condition number of K_free: {}", jnp.linalg.cond(K_free))
         u = solve(K)
+
+        jax.debug.print("🔎 NaN check: Any NaN in global K matrix? {}", jnp.any(jnp.isnan(u)))
+        jax.debug.print("🔎 NaN check: Any Inf in global K matrix? {}", jnp.any(jnp.isinf(u)))
         end_solve = time.perf_counter()
         
         # Calculate compliance

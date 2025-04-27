@@ -12,7 +12,7 @@ from jax.example_libraries import optimizers
 from materialCoeffs import microStrs
 import pickle
 import time
-import os
+import pandas as pd
 
 
 class TOuNN:
@@ -62,48 +62,105 @@ class TOuNN:
         C = {}
         for c in components:
             C[c] = jnp.zeros(self.FE.mesh.numElems)
-        for c in components:
+        for c in components:            
             for pw in range(mstr['order'] + 1):
                 C[c] = C[c].at[:].add(mstr[c][str(pw)] * vfracPow[str(pw)])
         return C
 
+
     def getCMatrix(self, mstrType, density, penal=1.0):
         components = ['00', '11', '22', '01', '02', '12', '44', '55', '66']
+        
+        # Step 1: Prepare powers of density
         vfracPow = {}
         for pw in range(self.mstrData['cube']['order'] + 1):
             vfracPow[str(pw)] = density ** pw
 
+        # Step 2: Prepare empty C matrices
         C = {c: jnp.zeros(self.FE.mesh.numElems) for c in components}
-        
-        # For debug output only (outside of autodiff)
+
+        # Step 3: Initialize debug log
+        debug_log = []
+
+        # Step 4: Prepare for optional debugging if not in autodiff mode
         if not isinstance(density, jax.core.Tracer):
             C_raw = {c: jnp.zeros(self.FE.mesh.numElems) for c in components}
             idx = jnp.array(np.arange(min(3, self.FE.mesh.numElems)))
             print("=== Raw C (pre-clip) and Penalized C for sample elements ===")
             
+        # Step 5: Start main loops
         for mstrCtr, mstrName in enumerate(self.mstrData):
             mstr = self.mstrData[mstrName]
             Cmstr = self.getCfromCPolynomial(vfracPow, mstr)
             mstrPenal = mstrType[:, mstrCtr] ** penal
 
+            # Add mstrType stats
+            mstrType_min = jnp.min(mstrType[:, mstrCtr])
+            mstrType_max = jnp.max(mstrType[:, mstrCtr])
+            mstrType_mean = jnp.mean(mstrType[:, mstrCtr])
+
             for c in components:
-                stabilized_C = jnp.clip(Cmstr[c], 1e-3, None)
-                
-                # Only collect raw values for debugging if not in gradient computation
+                # Values BEFORE clipping
+                cmstr_max = jnp.max(Cmstr[c])
+                cmstr_min = jnp.min(Cmstr[c])
+                cmstr_nan = jnp.any(jnp.isnan(Cmstr[c]))
+
+                stabilized_C = jnp.clip(Cmstr[c], 1e-2, None)
+
+                # Values AFTER clipping
+                stabilized_max = jnp.max(stabilized_C)
+                stabilized_min = jnp.min(stabilized_C)
+                stabilized_nan = jnp.any(jnp.isnan(stabilized_C))
+
+                # Optional raw value collection
                 if not isinstance(density, jax.core.Tracer):
                     C_raw[c] = C_raw[c].at[:].add(jnp.einsum('i,i->i', mstrType[:, mstrCtr], stabilized_C))
-                    
+
                 # Apply penalization and add to C
                 C[c] = C[c].at[:].add(jnp.einsum('i,i->i', mstrPenal, stabilized_C))
-        
-        # Debug printing only if not in gradient computation
+
+                # Values AFTER penalization
+                penalized_max = jnp.max(C[c])
+                penalized_min = jnp.min(C[c])
+                penalized_nan = jnp.any(jnp.isnan(C[c]))
+
+                # Step 6: Collect debug info
+                debug_log.append({
+                    'mstrName': mstrName,
+                    'component': c,
+                    'Cmstr_max': cmstr_max,
+                    'Cmstr_min': cmstr_min,
+                    'Cmstr_any_nan': cmstr_nan,
+                    'stabilized_max': stabilized_max,
+                    'stabilized_min': stabilized_min,
+                    'stabilized_any_nan': stabilized_nan,
+                    'C_max_after_penalization': penalized_max,
+                    'C_min_after_penalization': penalized_min,
+                    'C_any_nan_after_penalization': penalized_nan,
+                    'density_min': jnp.min(density),
+                    'density_max': jnp.max(density),
+                    'density_mean': jnp.mean(density),
+                    'mstrType_min': mstrType_min,
+                    'mstrType_max': mstrType_max,
+                    'mstrType_mean': mstrType_mean,
+                })
+
+        # Step 7: After loops, print and save debug info
         if not isinstance(density, jax.core.Tracer):
             for k in components:
-                raw_vals = C_raw[k][idx]  # No np.array conversion
-                penalized_vals = C[k][idx]  # No np.array conversion
+                raw_vals = C_raw[k][idx]
+                penalized_vals = C[k][idx]
                 print(f" C[{k}]: raw={raw_vals}, penalized={penalized_vals}, penal_factor={penal}")
-        
+
+            # Save debug log into CSV
+            df_debug = pd.DataFrame(debug_log)
+            df_debug.to_csv("debug_log_cmatrix.csv", index=False)
+            print("✅ Debug log saved to 'debug_log_cmatrix.csv'")
+        # C_all = jnp.concatenate([C[k] for k in components])
+        # jax.debug.print("✅ Final NaN check across all C: {}", jnp.any(jnp.isnan(C_all)))
         return C
+
+
 
     def optimizeDesign(self, optParams, savedNet):
         """
@@ -182,8 +239,8 @@ class TOuNN:
                 current_vf = jnp.mean(density)
                 error = target_vf - current_vf
                 adjustment_rate = 0.2  # Tune this parameter (0.05-0.2)
-                density = jnp.clip(density * (1 + adjustment_rate * error), 0.01, 0.99)
-
+                density = jnp.clip(density * (1 + adjustment_rate * error), 0.05, 0.99)
+                jax.debug.print("🛡️ Clipped density min: {}, max: {}, mean: {}", jnp.min(density), jnp.max(density), jnp.mean(density))
                 #if hasattr(self, 'maskFixedElems'):
                     #density = jnp.where(self.maskFixedElems, jnp.maximum(density, 0.2), density)
 
@@ -195,8 +252,11 @@ class TOuNN:
                 # Get C matrix with appropriate penalization
                 start_C = time.perf_counter()
                 C = self.getCMatrix(mstrType, density, penal)
+
                 end_C = time.perf_counter()
                 self.timers['getCMatrix'] += (end_C - start_C)
+                for key in C.keys():
+                    jax.debug.print("🔎 NaN check: C[{}] has NaNs: {}", key, jnp.any(jnp.isnan(C[key])))
                 
                 # Calculate compliance with fallback for NaN
                 try:
